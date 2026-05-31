@@ -1,0 +1,14 @@
+# pyproject.toml
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyclouds"
+version = "0.1.0"
+description = "Cloud detection and cloud coverage estimation"
+requires-python = ">=3.10"
+
+[tool.setuptools]
+packages = ["cloud"]
