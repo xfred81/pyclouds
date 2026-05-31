@@ -22,7 +22,7 @@ PYTORCH_INDEXES = {
 # Replace with your future GitHub release URL.
 #
 DEFAULT_MODEL_URL = (
-    "https://github.com/YOUR_GITHUB_USER/pyclouds/"
+    "https://github.com/xfred81/pyclouds/"
     "releases/download/v0.1.0/default_model.pth"
 )
 
