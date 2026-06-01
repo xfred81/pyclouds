@@ -68,7 +68,7 @@ class MaskEditor(QLabel):
 
     def set_tool_value(self, value: int):
         self.brush_size = max(1, int(value))
-        self.magic_tolerance = max(0, int(value))
+        self.magic_tolerance = max(0, min(40, int(value / 5)))
 
     def set_overlay_enabled(self, enabled: bool):
         self.overlay_enabled = enabled
