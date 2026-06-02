@@ -19,7 +19,7 @@ PYTORCH_INDEXES = {
 
 DEFAULT_MODEL_URL = (
     "https://github.com/xfred81/pyclouds/"
-    "releases/download/v0.1.0/default_model.pth"
+    "releases/download/v0.1.1/default_model.pth"
 )
 
 DEFAULT_MODEL_PATH = Path("share/model/default_model.pth")
