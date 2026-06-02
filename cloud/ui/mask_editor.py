@@ -3,9 +3,9 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
-from PyQt6.QtCore import Qt, QPoint, pyqtSignal
-from PyQt6.QtGui import QImage, QPixmap, QWheelEvent
-from PyQt6.QtWidgets import QLabel
+from PyQt6.QtCore import Qt, QPoint, QRect, pyqtSignal
+from PyQt6.QtGui import QImage, QPixmap, QWheelEvent, QPainter
+from PyQt6.QtWidgets import QWidget
 
 
 def bgr_to_qpixmap(image_bgr: np.ndarray) -> QPixmap:
@@ -22,7 +22,7 @@ def mask_to_qpixmap(mask: np.ndarray) -> QPixmap:
     return QPixmap.fromImage(qimage)
 
 
-class MaskEditor(QLabel):
+class MaskEditor(QWidget):
     mask_changed = pyqtSignal()
 
     def __init__(self):
@@ -33,7 +33,7 @@ class MaskEditor(QLabel):
 
         self.mode = "brush"
         self.brush_size = 25
-        self.magic_tolerance = 25
+        self.magic_tolerance = 2
         self.paint_value = 255
 
         self.overlay_enabled = True
@@ -41,25 +41,24 @@ class MaskEditor(QLabel):
 
         self._base_pixmap: QPixmap | None = None
         self._zoom = 1.0
+        self._display_rect: QRect | None = None
 
         self._history: list[np.ndarray] = []
         self._max_history = 20
         self._fill_points: list[tuple[int, int]] = []
 
-        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setMinimumSize(800, 500)
-        self.setText("No image loaded")
         self.setMouseTracking(True)
 
     def clear_mask(self):
         self.mask = None
         self.base_image_bgr = None
         self._base_pixmap = None
+        self._display_rect = None
         self._history.clear()
         self._fill_points.clear()
         self._zoom = 1.0
-        self.clear()
-        self.setText("No image loaded")
+        self.update()
 
     def set_mode(self, mode: str):
         if mode not in {"brush", "magic", "fill"}:
@@ -68,7 +67,9 @@ class MaskEditor(QLabel):
 
     def set_tool_value(self, value: int):
         self.brush_size = max(1, int(value))
-        self.magic_tolerance = max(0, min(40, int(value / 5)))
+
+        # Magic wand tolerance must be much finer than brush size.
+        self.magic_tolerance = max(0, min(25, int(value / 12)))
 
     def set_overlay_enabled(self, enabled: bool):
         self.overlay_enabled = enabled
@@ -124,7 +125,30 @@ class MaskEditor(QLabel):
 
         self._zoom *= 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
         self._zoom = max(0.1, min(self._zoom, 20.0))
-        self._refresh()
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+
+        if self._base_pixmap is None:
+            painter.drawText(
+                self.rect(),
+                Qt.AlignmentFlag.AlignCenter,
+                "No image loaded",
+            )
+            self._display_rect = None
+            return
+
+        target = self._compute_display_rect()
+        self._display_rect = target
+
+        scaled = self._base_pixmap.scaled(
+            target.size(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+
+        painter.drawPixmap(target, scaled)
 
     def mousePressEvent(self, event):
         if self.mask is None:
@@ -183,7 +207,35 @@ class MaskEditor(QLabel):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        self._refresh()
+        self.update()
+
+    def _compute_display_rect(self) -> QRect:
+        if self._base_pixmap is None:
+            return QRect()
+
+        pix_w = self._base_pixmap.width()
+        pix_h = self._base_pixmap.height()
+
+        if pix_w <= 0 or pix_h <= 0:
+            return QRect()
+
+        widget_w = self.width()
+        widget_h = self.height()
+
+        scale = min(
+            widget_w / pix_w,
+            widget_h / pix_h,
+        )
+
+        scale *= self._zoom
+
+        display_w = max(1, int(pix_w * scale))
+        display_h = max(1, int(pix_h * scale))
+
+        x = (widget_w - display_w) // 2
+        y = (widget_h - display_h) // 2
+
+        return QRect(x, y, display_w, display_h)
 
     def _paint_at(self, pos: QPoint, emit: bool):
         x, y = self._widget_to_image_coords(pos)
@@ -213,13 +265,40 @@ class MaskEditor(QLabel):
         if x is None or y is None:
             return
 
+        if self.paint_value == 0:
+            selected = self._flood_from_point(x, y)
+            self.mask[selected] = 0
+
+        else:
+            clicked_region = self._flood_from_point(x, y)
+            current_cloud = self.mask > 0
+
+            if np.any(current_cloud):
+                grown_region = self._grow_from_existing_mask(
+                    clicked_region=clicked_region,
+                    current_cloud=current_cloud,
+                )
+                selected = clicked_region | grown_region
+            else:
+                selected = clicked_region
+
+            self.mask[selected] = 255
+
+        self._rebuild_pixmap()
+
+    def _flood_from_point(self, x: int, y: int) -> np.ndarray:
         h, w = self.base_image_bgr.shape[:2]
+
         flood_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
         work = self.base_image_bgr.copy()
 
         tol = self.magic_tolerance
 
-        flags = 4 | cv2.FLOODFILL_MASK_ONLY | (255 << 8)
+        flags = (
+            4
+            | cv2.FLOODFILL_MASK_ONLY
+            | (255 << 8)
+        )
 
         cv2.floodFill(
             work,
@@ -231,9 +310,47 @@ class MaskEditor(QLabel):
             flags,
         )
 
-        selected = flood_mask[1:-1, 1:-1] > 0
-        self.mask[selected] = self.paint_value
-        self._rebuild_pixmap()
+        return flood_mask[1:-1, 1:-1] > 0
+
+    def _grow_from_existing_mask(
+        self,
+        clicked_region: np.ndarray,
+        current_cloud: np.ndarray,
+    ) -> np.ndarray:
+        image = self.base_image_bgr
+
+        if image is None:
+            return np.zeros(current_cloud.shape, dtype=bool)
+
+        if not np.any(clicked_region):
+            return np.zeros(current_cloud.shape, dtype=bool)
+
+        ref_color = image[clicked_region].mean(axis=0)
+
+        kernel_size = max(3, self.brush_size // 2)
+
+        kernel = np.ones(
+            (kernel_size, kernel_size),
+            dtype=np.uint8,
+        )
+
+        dilated = cv2.dilate(
+            current_cloud.astype(np.uint8),
+            kernel,
+            iterations=1,
+        ) > 0
+
+        border = dilated & ~current_cloud
+
+        diff = np.linalg.norm(
+            image.astype(np.float32) - ref_color.astype(np.float32),
+            axis=2,
+        )
+
+        color_limit = max(4.0, self.magic_tolerance * 2.0)
+        color_close = diff <= color_limit
+
+        return border & color_close
 
     def _add_fill_point(self, pos: QPoint):
         x, y = self._widget_to_image_coords(pos)
@@ -247,34 +364,26 @@ class MaskEditor(QLabel):
         if self.mask is None or self._base_pixmap is None:
             return None, None
 
-        img_h, img_w = self.mask.shape
-        pix_w, pix_h = self._displayed_pixmap_size()
+        rect = self._display_rect or self._compute_display_rect()
 
-        offset_x = (self.width() - pix_w) // 2
-        offset_y = (self.height() - pix_h) // 2
-
-        px = pos.x() - offset_x
-        py = pos.y() - offset_y
-
-        if px < 0 or py < 0 or px >= pix_w or py >= pix_h:
+        if rect.isNull():
             return None, None
 
-        x = int(px * img_w / pix_w)
-        y = int(py * img_h / pix_h)
+        if not rect.contains(pos):
+            return None, None
+
+        img_h, img_w = self.mask.shape
+
+        px = pos.x() - rect.x()
+        py = pos.y() - rect.y()
+
+        x = int(px * img_w / rect.width())
+        y = int(py * img_h / rect.height())
+
+        x = max(0, min(img_w - 1, x))
+        y = max(0, min(img_h - 1, y))
 
         return x, y
-
-    def _displayed_pixmap_size(self) -> tuple[int, int]:
-        base = self._base_pixmap.scaled(
-            self.size(),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-
-        return (
-            max(1, int(base.width() * self._zoom)),
-            max(1, int(base.height() * self._zoom)),
-        )
 
     def _rebuild_pixmap(self, show_fill_preview: bool = False):
         if self.mask is None:
@@ -328,19 +437,4 @@ class MaskEditor(QLabel):
 
             self._base_pixmap = mask_to_qpixmap(preview_mask > 0)
 
-        self._refresh()
-
-    def _refresh(self):
-        if self._base_pixmap is None:
-            return
-
-        w, h = self._displayed_pixmap_size()
-
-        scaled = self._base_pixmap.scaled(
-            w,
-            h,
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-
-        self.setPixmap(scaled)
+        self.update()
