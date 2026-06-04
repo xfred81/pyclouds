@@ -98,25 +98,39 @@ def install_pytorch(python: str, mode: str) -> None:
         PYTORCH_INDEXES[mode],
     ])
 
-
 def check_torch_installation(python: str) -> None:
     print()
     print("[INFO] Checking PyTorch installation...")
 
+    code = r"""
+import torch
+
+print("torch:", torch.__version__)
+print("cuda build:", torch.version.cuda)
+
+available = False
+count = 0
+device = "none"
+
+try:
+    available = torch.cuda.is_available()
+    if available:
+        count = torch.cuda.device_count()
+        if count > 0:
+            device = torch.cuda.get_device_name(0)
+except Exception as exc:
+    print("cuda check error:", exc)
+
+print("cuda available:", available)
+print("device count:", count)
+print("device:", device)
+"""
+
     run([
         python,
         "-c",
-        (
-            "import torch; "
-            "print('torch:', torch.__version__); "
-            "print('cuda build:', torch.version.cuda); "
-            "print('cuda available:', torch.cuda.is_available()); "
-            "print('device count:', torch.cuda.device_count()); "
-            "print('device:', torch.cuda.get_device_name(0) "
-            "if torch.cuda.is_available() else 'none')"
-        ),
+        code,
     ])
-
 
 def main() -> int:
     parser = argparse.ArgumentParser(

@@ -1,4 +1,4 @@
-# PyClouds
+# PyClouds 0.1.1
 
 PyClouds is an open-source cloud detection and cloud coverage estimation framework written in Python.
 
@@ -109,7 +109,7 @@ python install-requirements.py --mode gpu126
 
 ## Graphical Interface
 
-Launch:
+Launch on Linux:
 
 ```bash
 PYTHONPATH=. ./bin/cloud-identifier-ui.py
@@ -120,6 +120,21 @@ Or directly open an image:
 ```bash
 PYTHONPATH=. ./bin/cloud-identifier-ui.py image.jpg
 ```
+
+Launch on Windows:
+
+```bash
+set PYTHONPATH=.
+python bin\\cloud-identifier-ui.py
+```
+
+Or directly open an image:
+
+```bash
+set PYTHONPATH=.
+python bin\\cloud-identifier-ui.py image.jpg
+```
+
 
 The UI allows:
 
@@ -135,7 +150,7 @@ other scripts directly without `PYTHONPATH=. ...`
 
 ## Command Line Interface
 
-A command-line version is also available:
+A command-line version is also available, eg. for Linux:
 
 ```bash
 PYTHONPATH=. ./bin/cloud-identifier.py \
@@ -175,7 +190,7 @@ Training can be performed either on CPU or GPU.
 
 GPU training is strongly recommended for large datasets or frequent model retraining.
 
-Launch:
+Launch (Linux):
 
 ```bash
 PYTHONPATH=. ./bin/cloud-train-ui.py
