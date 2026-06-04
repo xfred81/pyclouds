@@ -14,6 +14,15 @@ import segmentation_models_pytorch as smp
 import warnings
 
 
+def resource_path(relative):
+    import sys
+    from pathlib import Path
+
+    if hasattr(sys, "_MEIPASS"):
+        return Path(sys._MEIPASS) / relative
+
+    return Path(__file__).resolve().parent.parent / relative
+
 @dataclass
 class IdentifierResult:
     """Result returned by the cloud identifier."""
@@ -68,7 +77,7 @@ class Identifier:
             self.device = "cpu"
 
         self.model, self.img_size, saved_threshold, self.mean, self.std = (
-            self._load_model(self.model_path)
+            self._load_model(resource_path(self.model_path))
         )
 
         self.threshold = (
