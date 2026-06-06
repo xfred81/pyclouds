@@ -30,6 +30,74 @@ from cloud.ui.mask_editor import MaskEditor
 
 
 DEFAULT_MODEL = "share/model/default_model.pth"
+MANUAL_EDIT_WIDTH = 400
+
+def compute_cloud_stats(
+    cloud_mask: np.ndarray,
+    valid_zone_mask: np.ndarray | None = None,
+) -> tuple[float, int, int]:
+    """Return cloud coverage percent, cloud pixels and valid sky pixels."""
+    mask = cloud_mask.astype(bool)
+
+    if valid_zone_mask is not None:
+        analyzed = valid_zone_mask.astype(bool)
+        cloud = mask & analyzed
+    else:
+        analyzed = np.ones(mask.shape, dtype=bool)
+        cloud = mask
+
+    valid_pixels = int(analyzed.sum())
+    cloud_pixels = int(cloud.sum())
+    cloud_percent = (
+        100.0 * cloud_pixels / valid_pixels
+        if valid_pixels > 0
+        else 0.0
+    )
+
+    return cloud_percent, cloud_pixels, valid_pixels
+
+
+def load_valid_zone_mask_for_image(
+    path: Path,
+    image_shape: tuple[int, int],
+) -> np.ndarray:
+    """Load a valid sky mask and resize it to image_shape=(height, width)."""
+    vm = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+
+    if vm is None:
+        raise ValueError(f"Could not read valid zone mask: {path}")
+
+    h, w = image_shape
+    vm = cv2.resize(vm, (w, h), interpolation=cv2.INTER_NEAREST)
+    return vm > 0
+
+
+def predict_cloud_mask(
+    image_bgr: np.ndarray,
+    model_path: str | Path,
+    threshold: float | None,
+    alpha: float,
+    enable_cuda: bool,
+    valid_zone_mask: np.ndarray | None = None,
+) -> tuple[np.ndarray, Identifier]:
+    """Run the cloud detector and return the predicted mask plus the Identifier."""
+    identifier = Identifier(
+        model_path=Path(model_path),
+        threshold=threshold,
+        alpha=alpha,
+        enable_cuda=enable_cuda,
+    )
+
+    valid_mask_gray = None
+    if valid_zone_mask is not None:
+        valid_mask_gray = valid_zone_mask.astype(np.uint8) * 255
+
+    result = identifier.predict(
+        image_bgr=image_bgr,
+        valid_mask_gray=valid_mask_gray,
+    )
+
+    return result.cloud_mask, identifier
 
 
 class MainWindow(QMainWindow):
@@ -59,6 +127,7 @@ class MainWindow(QMainWindow):
         self.cloud_percent = 0.0
         self.cloud_pixels = 0
         self.analyzed_pixels = 0
+        self.detection_running = False
 
         self._build_ui()
         self._build_menu()
@@ -93,12 +162,15 @@ class MainWindow(QMainWindow):
 
     def _build_left_panel(self) -> QWidget:
         panel = QFrame()
+        self.left_panel = panel
         panel.setFrameShape(QFrame.Shape.StyledPanel)
-        panel.setMaximumWidth(250)
 
         layout = QVBoxLayout(panel)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setAlignment(Qt.AlignmentFlag.AlignTop)
 
-        self.tool_value_label = QLabel("Threshold / size: 25")
+        self.tool_value_label = QLabel("Brush size / magic threshold: 25")
+        self.tool_value_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         self.tool_value_slider = QSlider(Qt.Orientation.Horizontal)
         self.tool_value_slider.setRange(1, 200)
@@ -109,9 +181,11 @@ class MainWindow(QMainWindow):
         self.overlay_btn = QPushButton("Sh&ow cloud overlay")
         self.overlay_btn.setCheckable(True)
         self.overlay_btn.setChecked(True)
+        self.overlay_btn.setToolTip("Show or hide the red cloud mask overlay.")
         self.overlay_btn.clicked.connect(self.on_overlay_toggled)
 
-        self.run_btn = QPushButton("Run identification")
+        self.run_btn = QPushButton("Run cloud detection")
+        self.run_btn.setToolTip("Run the model on the currently loaded image.")
         self.run_btn.clicked.connect(self.run_identification)
 
         self.brush_btn = QPushButton("&Brush")
@@ -130,31 +204,65 @@ class MainWindow(QMainWindow):
         self.undo_btn = QPushButton("&Undo")
         self.undo_btn.clicked.connect(self.mask_editor_undo)
 
-        self.reset_btn = QPushButton("&Reset")
+        self.reset_btn = QPushButton("&Reset mask")
         self.reset_btn.clicked.connect(self.reset_mask)
 
-        layout.addWidget(self._section_title("Parameters"))
-        layout.addWidget(QLabel("Threshold"))
-        layout.addWidget(self.tool_value_slider)
-        layout.addWidget(self.tool_value_label)
-        layout.addWidget(self.overlay_btn)
+        detect_section = QFrame()
+        detect_section.setFrameShape(QFrame.Shape.StyledPanel)
+        detect_layout = QVBoxLayout(detect_section)
+        detect_layout.setContentsMargins(8, 8, 8, 8)
+        detect_layout.addWidget(self._section_title("Detect clouds"))
+        detect_layout.addWidget(self.run_btn)
+        detect_layout.addWidget(self.overlay_btn)
 
-        layout.addWidget(self._separator())
+        self.edit_toggle = QPushButton("Manual mask editing")
+        self.edit_toggle.setFixedWidth(MANUAL_EDIT_WIDTH)
+        self.edit_toggle.setCheckable(True)
+        self.edit_toggle.setChecked(False)
+        self.edit_toggle.setStyleSheet("QPushButton { text-align: center; }")
+        self.edit_toggle.clicked.connect(self.on_edit_tools_toggled)
 
-        layout.addWidget(self._section_title("Define cloud overlay"))
-        layout.addWidget(self.run_btn)
+        self.edit_tools_widget = QFrame()
+        self.edit_tools_widget.setFixedWidth(MANUAL_EDIT_WIDTH)
+        self.edit_tools_widget.setFrameShape(QFrame.Shape.StyledPanel)
+        edit_layout = QVBoxLayout(self.edit_tools_widget)
+        edit_layout.setContentsMargins(8, 8, 8, 8)
 
-        layout.addWidget(self._separator())
+        note = QLabel(
+            "Manual edits are mainly useful to create clean training pairs: "
+            "a reference sky image plus its cloud mask. These pairs can then "
+            "be used to improve the model."
+        )
+        note.setWordWrap(True)
+        note.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        note.setStyleSheet("color: #666; font-size: 11px;")
 
-        layout.addWidget(self.brush_btn)
-        layout.addWidget(self.fill_btn)
-        layout.addWidget(self.magic_btn)
-        layout.addWidget(self.undo_btn)
-        layout.addWidget(self.reset_btn)
+        tool_value_title = QLabel("Tool value")
+        tool_value_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
+        edit_layout.addWidget(note)
+        edit_layout.addWidget(tool_value_title)
+        edit_layout.addWidget(self.tool_value_slider)
+        edit_layout.addWidget(self.tool_value_label)
+        edit_layout.addSpacing(6)
+        edit_layout.addWidget(self.brush_btn)
+        edit_layout.addWidget(self.fill_btn)
+        edit_layout.addWidget(self.magic_btn)
+        edit_layout.addWidget(self.undo_btn)
+        edit_layout.addWidget(self.reset_btn)
+
+        self.edit_tools_widget.setVisible(False)
+
+        layout.addWidget(detect_section)
+        layout.addSpacing(8)
+        layout.addWidget(self.edit_toggle)
+        layout.addWidget(self.edit_tools_widget)
         layout.addStretch()
 
         return panel
+
+    def on_edit_tools_toggled(self, checked: bool):
+        self.edit_tools_widget.setVisible(checked)
 
     def _build_center_panel(self) -> QWidget:
         panel = QWidget()
@@ -321,7 +429,7 @@ class MainWindow(QMainWindow):
         self.reset_action.setEnabled(has_image)
         self.overlay_action.setEnabled(has_image)
 
-        self.run_btn.setEnabled(has_image)
+        self.run_btn.setEnabled(has_image and not self.detection_running)
         self.undo_btn.setEnabled(has_image)
         self.reset_btn.setEnabled(has_image)
         self.overlay_btn.setEnabled(has_image)
@@ -388,16 +496,14 @@ class MainWindow(QMainWindow):
             self.error("Load an image first")
             return
 
-        vm = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
-
-        if vm is None:
-            self.error(f"Could not read valid zone mask: {path}")
+        try:
+            self.valid_zone_mask = load_valid_zone_mask_for_image(
+                path,
+                self.image_bgr.shape[:2],
+            )
+        except ValueError as exc:
+            self.error(str(exc))
             return
-
-        h, w = self.image_bgr.shape[:2]
-
-        vm = cv2.resize(vm, (w, h), interpolation=cv2.INTER_NEAREST)
-        self.valid_zone_mask = vm > 0
 
         current_mask = self.mask_editor.get_mask_bool()
         current_mask = current_mask & self.valid_zone_mask
@@ -411,30 +517,37 @@ class MainWindow(QMainWindow):
         self.valid_zone_label.setText(f"Valid zone: {path.name}")
         self.recompute_stats_from_editor()
 
+    def set_detection_running(self, running: bool):
+        self.detection_running = running
+        self.run_btn.setEnabled((self.image_bgr is not None) and not running)
+        self.run_btn.setText(
+            "Detecting clouds..."
+            if running
+            else "Run cloud detection"
+        )
+        QApplication.processEvents()
+
     def run_identification(self):
+        if self.detection_running:
+            return
+
         try:
             if self.image_bgr is None:
                 raise ValueError("Load an image first")
 
-            self.identifier = Identifier(
+            self.set_detection_running(True)
+
+            cloud_mask, self.identifier = predict_cloud_mask(
+                image_bgr=self.image_bgr,
                 model_path=self.model_path,
                 threshold=self.threshold_override,
                 alpha=self.alpha,
                 enable_cuda=self.enable_cuda_action.isChecked(),
-            )
-
-            valid_mask_gray = None
-
-            if self.valid_zone_mask is not None:
-                valid_mask_gray = self.valid_zone_mask.astype(np.uint8) * 255
-
-            result = self.identifier.predict(
-                image_bgr=self.image_bgr,
-                valid_mask_gray=valid_mask_gray,
+                valid_zone_mask=self.valid_zone_mask,
             )
 
             self.mask_editor.set_mask(
-                result.cloud_mask,
+                cloud_mask,
                 base_image_bgr=self.image_bgr,
                 reset_zoom=False,
             )
@@ -450,15 +563,15 @@ class MainWindow(QMainWindow):
                 )
             else:
                 self.device_label.setText(
-                    f"Device2: {self.identifier.device}"
+                    f"Device: {self.identifier.device}"
                 )
 
             self.recompute_stats_from_editor()
 
         except Exception as exc:
             self.error(str(exc))
-
-
+        finally:
+            self.set_detection_running(False)
 
     def save_cloud_mask(self):
         if self.image_bgr is None:
@@ -539,22 +652,11 @@ class MainWindow(QMainWindow):
             return
 
         mask = self.mask_editor.get_mask_bool()
-
-        if self.valid_zone_mask is not None:
-            analyzed = self.valid_zone_mask
-            cloud = mask & analyzed
-        else:
-            analyzed = np.ones(mask.shape, dtype=bool)
-            cloud = mask
-
-        self.analyzed_pixels = int(analyzed.sum())
-        self.cloud_pixels = int(cloud.sum())
-
-        self.cloud_percent = (
-            100.0 * self.cloud_pixels / self.analyzed_pixels
-            if self.analyzed_pixels > 0
-            else 0.0
-        )
+        (
+            self.cloud_percent,
+            self.cloud_pixels,
+            self.analyzed_pixels,
+        ) = compute_cloud_stats(mask, self.valid_zone_mask)
 
         self.coverage_label.setText(f"Cloud coverage: {self.cloud_percent:.2f}%")
         self.cloud_pixels_label.setText(f"Cloud pixels: {self.cloud_pixels}")
@@ -605,7 +707,7 @@ class MainWindow(QMainWindow):
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Qt6 UI for cloud mask prediction and editing.",
+        description="Cloud mask prediction and editing tool.",
     )
 
     parser.add_argument(
@@ -636,17 +738,78 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
+        "--valid-mask",
+        default=None,
+        help="Optional valid sky mask. White/non-zero pixels are analyzed.",
+    )
+
+    parser.add_argument(
         "--no-cuda",
         action="store_true",
         help="Disable CUDA.",
     )
 
+    parser.add_argument(
+        "--no-gui",
+        action="store_true",
+        help="Run cloud detection in console mode and print statistics.",
+    )
+
     return parser
+
+
+def run_no_gui(args: argparse.Namespace) -> int:
+    if not args.input:
+        raise SystemExit("error: --no-gui requires an input image")
+
+    image_path = Path(args.input)
+    image_bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+
+    if image_bgr is None:
+        raise SystemExit(f"error: could not read image: {image_path}")
+
+    valid_zone_mask = None
+    if args.valid_mask:
+        valid_zone_mask = load_valid_zone_mask_for_image(
+            Path(args.valid_mask),
+            image_bgr.shape[:2],
+        )
+
+    cloud_mask, identifier = predict_cloud_mask(
+        image_bgr=image_bgr,
+        model_path=args.model,
+        threshold=args.threshold,
+        alpha=args.alpha,
+        enable_cuda=not args.no_cuda,
+        valid_zone_mask=valid_zone_mask,
+    )
+
+    cloud_percent, cloud_pixels, valid_pixels = compute_cloud_stats(
+        cloud_mask,
+        valid_zone_mask,
+    )
+
+    print(f"Image: {image_path}")
+    print(f"Model: {args.model}")
+    print(f"Device: {identifier.device}")
+
+    if identifier.device_warning:
+        print(f"CUDA warning: {identifier.device_warning}")
+
+    print(f"Model threshold: {identifier.threshold:.3f}")
+    print(f"Cloud coverage: {cloud_percent:.2f}%")
+    print(f"Cloud pixels: {cloud_pixels}")
+    print(f"Valid sky pixels: {valid_pixels}")
+
+    return 0
 
 
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+
+    if args.no_gui:
+        return run_no_gui(args)
 
     app = QApplication([])
 
@@ -657,6 +820,9 @@ def main() -> int:
         alpha=args.alpha,
         enable_cuda=not args.no_cuda,
     )
+
+    if args.valid_mask:
+        window.load_and_apply_valid_zone_mask(Path(args.valid_mask))
 
     window.show()
 
