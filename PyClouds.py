@@ -111,7 +111,7 @@ class MainWindow(QMainWindow):
     ):
         super().__init__()
 
-        self.setWindowTitle("PyClouds Identifier")
+        self.setWindowTitle("PyClouds 0.1.4")
 
         self.model_path = Path(model_path)
         self.threshold_override = threshold
